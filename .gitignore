@@ -1,0 +1,25 @@
+# ── Generated outputs ──────────────────────────────
+*.mp4
+*.webm
+*.mov
+snapshot_*.png
+data.js
+*.csv
+
+# Reference frames pulled from downloaded videos
+reference_frames/
+
+# ── Python ─────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# ── Editors / OS ───────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

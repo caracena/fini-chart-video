@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fini Chart Race</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@500;600;700;800;900&family=Roboto+Condensed:wght@400;700;800&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; background: #1c1c1c; }
+  body { display: flex; align-items: center; justify-content: center; overflow: hidden;
+         font-family: Montserrat, system-ui, sans-serif; }
+  canvas { display: block; width: min(100vw, calc(100vh * 9 / 16)); height: auto;
+           box-shadow: 0 0 40px rgba(0,0,0,.45); }
+  body.record { background: #fff; display: block; }
+  body.record canvas { width: 1080px; height: 1920px; box-shadow: none; }
+  #ui { position: fixed; left: 12px; bottom: 12px; display: flex; gap: 6px; align-items: center;
+        background: rgba(0,0,0,.65); padding: 6px; border-radius: 10px; color: #eee; font-size: 13px; }
+  #ui button { font: 600 13px Montserrat, sans-serif; border: 0; border-radius: 7px; padding: 7px 11px;
+               cursor: pointer; background: #333; color: #fff; }
+  #ui button:hover { background: #555; }
+  #ui button.rec { background: #C8102E; }
+  #ui input { width: 220px; }
+  #msg { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); background: #C8102E; color: #fff;
+         font: 600 14px Montserrat, sans-serif; padding: 10px 16px; border-radius: 8px; display: none; max-width: 90vw; }
+  body.record #ui, body.record #msg { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<div id="ui">
+  <button id="play" title="Play / pausa (espacio)">⏸</button>
+  <button id="restart" title="Reiniciar (R)">⟲</button>
+  <input id="seek" type="range" min="0" max="1000" value="0">
+  <span id="time">0.0s</span>
+  <button id="rec" class="rec" title="Graba en el navegador (tiempo real)">⏺ Grabar</button>
+</div>
+<div id="msg"></div>
+
+<script src="config.js"></script>
+<script src="data.js"></script>
+<script>
+(() => {
+"use strict";
+const W = 1080, H = 1920;
+const params = new URLSearchParams(location.search);
+const RECORD = params.has("record");
+if (RECORD) document.body.classList.add("record");
+
+const msg = (t) => { const m = document.getElementById("msg"); m.textContent = t; m.style.display = "block"; };
+if (!window.CHART_DATA) { msg("No se encontró data.js — ejecuta primero: python fetch_data.py ^GSPC GC=F"); return; }
+
+// ───────────── config & data ─────────────
+const DEF_THEME = { bg:"#FBFAF6", panel:"#F3F2EE", text:"#111", axis:"#222", grid:"rgba(0,0,0,0.055)", year:"#8C8C8C",
+  up:"#1FA34A", down:"#D2283A", eventLine:"rgba(200,30,55,0.55)", popupBg:"rgba(255,241,243,0.97)", popupBorder:"#C8102E" };
+const C = Object.assign({ title:"", subtitle:"", showVsRow:true, sourceText:"fuente: Yahoo Finance", brand:"",
+  locale:"es-CL", logScale:false, intro:0.6, duration:18, eventPause:1.4, endHold:3, fps:30, compare:[0,1],
+  compareCaption:true, icons:{}, events:[], eventMinDrop:10, dropText:"{asset} cayó ~{pct}%", minSpanYears:1 },
+  window.CHART_CONFIG || {});
+C.theme = Object.assign({}, DEF_THEME, C.theme || {});
+const T = C.theme;
+const D = window.CHART_DATA;
+const CUR = D.currency || "$";
+const YEAR = 365.25 * 864e5;
+
+const dates = D.dates.map(s => Date.parse(s + "T00:00:00Z"));
+const N = dates.length;
+const S = D.series;
+const spanYears = (dates[N-1] - dates[0]) / YEAR;
+const perYear = (N - 1) / Math.max(spanYears, 1e-6);
+
+// running max/min over all series (for fast y-scaling)
+const preMax = new Float64Array(N), preMin = new Float64Array(N);
+for (let i = 0; i < N; i++) {
+  let mx = i ? preMax[i-1] : -Infinity, mn = i ? preMin[i-1] : Infinity;
+  for (const s of S) { mx = Math.max(mx, s.values[i]); mn = Math.min(mn, s.values[i]); }
+  preMax[i] = mx; preMin[i] = mn;
+}
+
+function indexOfTime(t) {           // fractional index for a timestamp
+  if (t <= dates[0]) return 0;
+  if (t >= dates[N-1]) return N - 1;
+  let lo = 0, hi = N - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (dates[m] <= t) lo = m; else hi = m; }
+  return lo + (t - dates[lo]) / (dates[hi] - dates[lo]);
+}
+const lerpArr = (a, p) => { const i = Math.floor(p), f = p - i; return i >= a.length - 1 ? a[a.length-1] : a[i] + (a[i+1] - a[i]) * f; };
+
+// ───────────── formatting ─────────────
+const nf0 = new Intl.NumberFormat(C.locale, { maximumFractionDigits: 0 });
+const nf2 = new Intl.NumberFormat(C.locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const nfc = new Intl.NumberFormat(C.locale, { notation: "compact", maximumFractionDigits: 1 });
+const SMALL = Math.max(...S.map(s => Math.max(...s.values))) < 20;   // tiny prices → show cents
+const money = (v, compact) => {
+  const a = Math.abs(v);
+  const s = compact && a >= 1e5 ? nfc.format(v) : (SMALL && v !== 0) ? nf2.format(v) : nf0.format(v);
+  return CUR + s;
+};
+const monthFmt = new Intl.DateTimeFormat(C.locale, { month: "short", year: "numeric", timeZone: "UTC" });
+const fmtMonth = (t) => { const s = monthFmt.format(new Date(t)).replace(".", ""); return s[0].toUpperCase() + s.slice(1); };
+const pct = (x) => (x >= 0 ? "+" : "−") + nf0.format(Math.abs(Math.round(x))) + "%";
+
+// ───────────── events (crisis pop-ups) ─────────────
+const EVENTS = (C.events || []).map(e => {
+  const t = Date.parse(e.date + "T00:00:00Z");
+  if (!(t > dates[0] && t < dates[N-1])) return null;
+  const idx = indexOfTime(t), a = Math.min(e.asset || 0, S.length - 1), v = S[a].values;
+  const i0 = Math.round(idx), w = Math.max(1, Math.round(perYear * 0.35));
+  let pk = i0;
+  for (let i = Math.max(0, i0 - w); i <= Math.min(N - 1, i0 + w); i++) if (v[i] > v[pk]) pk = i;
+  let tr = pk;
+  for (let i = pk; i < N; i++) { if (v[i] < v[tr]) tr = i; if (v[i] > v[pk] && i > tr) break; }
+  const drop = e.drop != null ? Math.abs(e.drop) : (1 - v[tr] / v[pk]) * 100;
+  if (e.drop == null && drop < C.eventMinDrop) return null;
+  return { ...e, t, idx, drop, assetName: S[a].name };
+}).filter(Boolean).sort((a, b) => a.idx - b.idx);
+
+// ───────────── timeline ─────────────
+const speed = (N - 1) / C.duration;            // data points per second
+let acc = C.intro, last = 0;
+for (const e of EVENTS) { acc += (e.idx - last) / speed; e.tStart = acc; acc += C.eventPause; last = e.idx; }
+const T_END_DRAW = acc + (N - 1 - last) / speed;
+const TOTAL = T_END_DRAW + C.endHold;
+
+function progressAt(t) {                         // → fractional data index
+  if (t <= C.intro) return 0;
+  let tt = t - C.intro, p = 0;
+  for (const e of EVENTS) {
+    const reach = (e.idx - p) / speed;
+    if (tt < reach) return p + tt * speed;
+    tt -= reach; p = e.idx;
+    if (tt < C.eventPause) return p;
+    tt -= C.eventPause;
+  }
+  return Math.min(N - 1, p + tt * speed);
+}
+
+// ───────────── layout ─────────────
+const L = { titleY: 250, subY: 318, vsY: C.subtitle ? 440 : 415,
+  panelTop: 535, panelBot: 1590, PL: 205, PR: 805, PT: 700, PB: 1500, footY: 1680 };
+
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+const F = (w, s, fam) => `${w} ${s}px ${fam || "Montserrat"}, "Segoe UI", Arial, sans-serif`;
+
+// ───────────── icons ─────────────
+const IMG = {};
+const iconSpec = (s) => (C.icons && (C.icons[s.ticker] ?? C.icons[s.name])) || null;
+const isImagePath = (x) => typeof x === "string" && /\.(png|jpe?g|webp|svg|gif)$/i.test(x);
+const imgLoads = S.map(s => {
+  const spec = iconSpec(s);
+  if (!isImagePath(spec)) return Promise.resolve();
+  return new Promise(res => { const im = new Image(); im.onload = () => { IMG[spec] = im; res(); }; im.onerror = res; im.src = spec; });
+});
+
+function roundRect(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x, y, w, h, r) : ctx.rect(x, y, w, h); }
+function drawBar(x, y, w, h, light, mid, dark) {   // one ingot, (x,y) = top-left of the front face
+  const d = h * 0.55;
+  ctx.beginPath(); ctx.moveTo(x + d, y - d * 0.6); ctx.lineTo(x + w - d, y - d * 0.6); ctx.lineTo(x + w, y); ctx.lineTo(x, y); ctx.closePath();
+  ctx.fillStyle = light; ctx.fill();
+  const g = ctx.createLinearGradient(x, y, x, y + h); g.addColorStop(0, mid); g.addColorStop(1, dark);
+  ctx.fillStyle = g; ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = "rgba(90,60,0,0.35)"; ctx.lineWidth = Math.max(1, h * 0.06); ctx.strokeRect(x, y, w, h);
+}
+function drawIngots(cx, cy, size, metal) {
+  const [l, m, d] = metal === "silver" ? ["#F4F6F8", "#D3D8DE", "#8E979F"] : ["#FFE88A", "#F6C536", "#C48A06"];
+  const bw = size * 0.48, bh = size * 0.24, base = cy + size * 0.36;
+  drawBar(cx - bw - 2, base - bh, bw, bh, l, m, d);
+  drawBar(cx + 2, base - bh, bw, bh, l, m, d);
+  drawBar(cx - bw / 2, base - bh * 2 - bh * 0.45, bw, bh, l, m, d);
+}
+function drawBadge(cx, cy, size, color, text) {
+  roundRect(cx - size / 2, cy - size / 2, size, size, size * 0.07); ctx.fillStyle = color; ctx.fill();
+  const lines = String(text).split("\n");
+  let fs = size * (lines.length > 1 ? 0.3 : 0.34);
+  ctx.font = F(900, fs);
+  const widest = Math.max(...lines.map(t => ctx.measureText(t).width));
+  if (widest > size * 0.84) { fs *= size * 0.84 / widest; ctx.font = F(900, fs); }
+  ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  lines.forEach((t, i) => ctx.fillText(t, cx, cy + (i - (lines.length - 1) / 2) * fs * 1.0));
+}
+function drawCoin(cx, cy, size, color, text) {
+  const r = size * 0.42;
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.fillStyle = color; ctx.fill();
+  ctx.lineWidth = r * 0.12; ctx.strokeStyle = "rgba(0,0,0,0.18)"; ctx.stroke();
+  ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  const t = String(text).replace("\n", ""); ctx.font = F(900, r * (t.length > 2 ? 0.55 : 1.05));
+  ctx.fillText(t, cx, cy + r * 0.05);
+}
+function drawIcon(s, cx, cy, size) {
+  ctx.save();
+  const spec = iconSpec(s);
+  if (spec === "gold" || spec === "silver") drawIngots(cx, cy, size, spec);
+  else if (spec === "coin") drawCoin(cx, cy, size, s.color, s.short || s.name[0]);
+  else if (isImagePath(spec) && IMG[spec]) {
+    const im = IMG[spec], k = Math.min(size / im.width, size / im.height);
+    ctx.drawImage(im, cx - im.width * k / 2, cy - im.height * k / 2, im.width * k, im.height * k);
+  } else if (spec && !isImagePath(spec)) {
+    ctx.font = F(400, size * 0.82); ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(spec, cx, cy + size * 0.04);
+  } else drawBadge(cx, cy, size * 0.82, s.color, s.short || s.name);
+  ctx.restore();
+}
+
+// ───────────── text helpers ─────────────
+function fitFont(text, weight, size, maxW, fam, min = 20) {
+  ctx.font = F(weight, size, fam);
+  while (ctx.measureText(text).width > maxW && size > min) { size -= 2; ctx.font = F(weight, size, fam); }
+  return size;
+}
+function haloText(text, x, y, color, halo = 10) {
+  ctx.lineJoin = "round"; ctx.lineWidth = halo; ctx.strokeStyle = T.bg; ctx.strokeText(text, x, y);
+  ctx.fillStyle = color; ctx.fillText(text, x, y);
+}
+const easeOutBack = (x) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); };
+const clamp01 = (x) => Math.max(0, Math.min(1, x));
+
+// ───────────── scales ─────────────
+function niceStep(raw) {
+  const p = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / p;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * p;
+}
+
+// ───────────── render one frame ─────────────
+function render(t) {
+  t = Math.max(0, Math.min(TOTAL, t));
+  const p = progressAt(t);
+  const curT = lerpArr(dates, p);
+  const introA = clamp01(t / Math.max(0.01, C.intro));
+  const { PL, PR, PT, PB } = L;
+
+  // background + header
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = T.bg; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center"; ctx.textBaseline = "alphabetic"; ctx.fillStyle = T.text;
+  fitFont(C.title, 700, 64, 980, '"Roboto Condensed"');
+  ctx.fillText(C.title, W / 2, L.titleY);
+  if (C.subtitle) {
+    fitFont(C.subtitle, 600, 36, 960); ctx.fillStyle = "#555"; ctx.fillText(C.subtitle, W / 2, L.subY);
+  }
+  if (C.showVsRow) {
+    const n = S.length, isz = n <= 2 ? 130 : n === 3 ? 112 : n === 4 ? 96 : 80;
+    ctx.font = F(800, 44); const vsW = ctx.measureText("vs").width + 56;
+    const total = n * isz + (n - 1) * vsW;
+    let x = (W - total) / 2 + isz / 2;
+    S.forEach((s, i) => {
+      drawIcon(s, x, L.vsY, isz);
+      if (i < n - 1) { ctx.font = F(800, 44); ctx.fillStyle = T.text; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText("vs", x + isz / 2 + vsW / 2, L.vsY); }
+      x += isz + vsW;
+    });
+  }
+  ctx.fillStyle = T.panel; ctx.fillRect(0, L.panelTop, W, L.panelBot - L.panelTop);
+
+  // scales
+  const i = Math.floor(p);
+  const cur = S.map(s => lerpArr(s.values, p));
+  let vMax = Math.max(preMax[i], ...cur), vMin = Math.min(preMin[i], ...cur);
+  const xMin = dates[0], xMax = Math.max(curT, Math.min(dates[N-1], dates[0] + C.minSpanYears * YEAR));
+  const X = (tm) => PL + (tm - xMin) / (xMax - xMin) * (PR - PL);
+  let Y, yTicks = [];
+  if (C.logScale) {
+    const lo = Math.log10(Math.max(1e-9, vMin * 0.8)), hi = Math.log10(vMax * 1.25);
+    Y = (v) => PB - (Math.log10(Math.max(v, 1e-9)) - lo) / (hi - lo) * (PB - PT);
+    for (let e = Math.floor(lo); e <= Math.ceil(hi); e++) for (const m of [1, 2, 5]) {
+      const v = m * Math.pow(10, e); if (Math.log10(v) >= lo && Math.log10(v) <= hi) yTicks.push(v);
+    }
+    if (yTicks.length > 10) yTicks = yTicks.filter(v => /^1/.test(String(v)));
+  } else {
+    const top = vMax * 1.1, step = niceStep(top / 6);
+    Y = (v) => PB - v / top * (PB - PT);
+    for (let v = 0; v <= top + 1e-9; v += step) yTicks.push(v);
+  }
+  const compactY = vMax >= 1e6;
+
+  ctx.globalAlpha = introA;
+  // grid + y labels
+  ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.font = F(700, 30);
+  for (const v of yTicks) {
+    const y = Y(v); if (y < PT - 30 || y > PB + 1) continue;
+    ctx.strokeStyle = T.grid; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(PL, y); ctx.lineTo(PR, y); ctx.stroke();
+    ctx.strokeStyle = T.axis; ctx.beginPath(); ctx.moveTo(PL - 12, y); ctx.lineTo(PL, y); ctx.stroke();
+    ctx.fillStyle = T.axis; ctx.fillText(money(v, compactY), PL - 20, y);
+  }
+  // x labels
+  const span = (xMax - xMin) / YEAR, yStep = span <= 8 ? 1 : span <= 14 ? 2 : span <= 32 ? 5 : 10;
+  const y0 = new Date(xMin).getUTCFullYear(), y1 = new Date(xMax).getUTCFullYear();
+  ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.font = F(700, 30);
+  const labelsX = [{ yr: y0, x: PL }];
+  for (let yr = y0 + 1; yr <= y1; yr++) if (yr % yStep === 0) labelsX.push({ yr, x: X(Date.UTC(yr, 0, 1)) });
+  labelsX.forEach((o, k) => {
+    if (k === 1 && o.x - labelsX[0].x < 90) return;      // avoid overlap with first label
+    if (o.x > PR + 2) return;
+    ctx.strokeStyle = T.axis; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(o.x, PB); ctx.lineTo(o.x, PB + 12); ctx.stroke();
+    ctx.fillStyle = T.axis; ctx.fillText(String(o.yr), o.x, PB + 20);
+  });
+
+  // big year + compare %
+  ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  ctx.font = F(800, 120); ctx.fillStyle = T.year; ctx.globalAlpha = introA * 0.92;
+  ctx.fillText(String(new Date(curT).getUTCFullYear()), PL + 40, PT + 90);
+  ctx.globalAlpha = introA;
+  let cmp = null, cap = "";
+  if (Array.isArray(C.compare) && S.length > 1 && t > C.intro) {
+    const [a, b] = C.compare; if (S[a] && S[b]) { cmp = (cur[a] / cur[b] - 1) * 100; cap = `${S[a].name} vs ${S[b].name}`; }
+  } else if (C.compare === "return" && t > C.intro) { cmp = (cur[0] / S[0].values[0] - 1) * 100; cap = `${S[0].name} desde ${y0}`; }
+  if (cmp !== null) {
+    ctx.font = F(800, 54); ctx.fillStyle = cmp >= 0 ? T.up : T.down; ctx.fillText(pct(cmp), PL + 44, PT + 160);
+    if (C.compareCaption) { ctx.font = F(600, 26); ctx.fillStyle = T.year; ctx.fillText(cap, PL + 46, PT + 198); }
+  }
+
+  // event dashed lines
+  ctx.setLineDash([12, 12]); ctx.lineWidth = 3; ctx.strokeStyle = T.eventLine;
+  for (const e of EVENTS) if (e.t <= curT + 1) {
+    const x = X(e.t); ctx.beginPath(); ctx.moveTo(x, PT - 20); ctx.lineTo(x, PB); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // lines (first series drawn last → on top)
+  ctx.save(); ctx.beginPath(); ctx.rect(PL, PT - 60, PR - PL + 14, PB - PT + 60); ctx.clip();
+  ctx.lineJoin = "round"; ctx.lineCap = "round";
+  for (let k = S.length - 1; k >= 0; k--) {
+    const v = S[k].values;
+    ctx.beginPath(); ctx.moveTo(X(dates[0]), Y(v[0]));
+    for (let j = 1; j <= i; j++) ctx.lineTo(X(dates[j]), Y(v[j]));
+    if (p > i) ctx.lineTo(X(curT), Y(cur[k]));
+    ctx.strokeStyle = S[k].color; ctx.lineWidth = 9; ctx.stroke();
+  }
+  ctx.restore();
+
+  // axes
+  ctx.strokeStyle = T.axis; ctx.lineWidth = 4; ctx.beginPath();
+  ctx.moveTo(PL, PT - 30); ctx.lineTo(PL, PB); ctx.lineTo(PR + 6, PB); ctx.stroke();
+
+  // tip dots + end labels
+  const tipX = X(curT);
+  const tips = S.map((s, k) => ({ k, y: Y(cur[k]), ly: Y(cur[k]) })).sort((a, b) => a.y - b.y);
+  const G = 92;
+  for (let j = 1; j < tips.length; j++) tips[j].ly = Math.max(tips[j].ly, tips[j-1].ly + G);
+  if (tips.length) tips[tips.length-1].ly = Math.min(tips[tips.length-1].ly, PB - 20);
+  for (let j = tips.length - 2; j >= 0; j--) tips[j].ly = Math.min(tips[j].ly, tips[j+1].ly - G);
+  for (const o of tips) o.ly = Math.max(o.ly, PT - 40);
+  for (const o of tips) {
+    const s = S[o.k];
+    ctx.beginPath(); ctx.arc(tipX, o.y, 12, 0, 7); ctx.fillStyle = s.color; ctx.fill();
+    ctx.lineWidth = 5; ctx.strokeStyle = "#fff"; ctx.stroke();
+    const lx = tipX + 26, maxW = W - lx - 50;
+    drawIcon(s, lx + 20, o.ly - 22, 46);
+    ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    fitFont(s.name, 800, 34, maxW - 50, null, 22); haloText(s.name, lx + 50, o.ly - 20, s.color);
+    const val = money(cur[o.k], true);
+    fitFont(val, 800, 38, maxW - 50, null, 22); haloText(val, lx + 50, o.ly + 22, s.color);
+  }
+
+  // crisis pop-up
+  for (const e of EVENTS) {
+    const age = t - e.tStart, life = C.eventPause + 0.35;
+    if (age < 0 || age > life) continue;
+    const sc = easeOutBack(clamp01(age / 0.28)), a = clamp01((life - age) / 0.3);
+    drawPopup(e, sc, a * introA);
+  }
+  ctx.globalAlpha = 1;
+
+  // footer
+  ctx.textBaseline = "alphabetic";
+  ctx.textAlign = "left"; ctx.font = F(400, 40, '"Roboto Condensed"'); ctx.fillStyle = "#3a3a3a";
+  ctx.fillText(D.source === "demo" ? "⚠ DATOS DE PRUEBA (demo)" : (C.sourceText || ""), 80, L.footY);
+  if (C.brand) { ctx.textAlign = "right"; ctx.font = F(800, 38); ctx.fillStyle = T.text; ctx.fillText(C.brand, W - 80, L.footY); }
+}
+
+function drawPopup(e, sc, a) {
+  const cx = (L.PL + L.PR) / 2 + 20, cy = L.PT + 330, bw = 560, bh = 220;
+  ctx.save(); ctx.globalAlpha = a; ctx.translate(cx, cy); ctx.scale(sc, sc);
+  ctx.shadowColor = "rgba(0,0,0,0.18)"; ctx.shadowBlur = 24; ctx.shadowOffsetY = 6;
+  roundRect(-bw / 2, -bh / 2, bw, bh, 16); ctx.fillStyle = T.popupBg; ctx.fill();
+  ctx.shadowColor = "transparent"; ctx.lineWidth = 5; ctx.strokeStyle = T.popupBorder; ctx.stroke();
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = F(600, 32); ctx.fillStyle = "#555"; ctx.fillText(fmtMonth(e.t), 0, -62);
+  fitFont(e.label, 800, 44, bw - 60, null, 28); ctx.fillStyle = T.popupBorder; ctx.fillText(e.label, 0, -4);
+  const dropLine = C.dropText.replace("{pct}", nf0.format(Math.round(e.drop))).replace("{asset}", e.assetName);
+  fitFont(dropLine, 800, 44, bw - 150, null, 26); ctx.fillText(dropLine, 30, 54);
+  ctx.font = F(400, 62); ctx.fillText("💀", -bw / 2 + 52, bh / 2 - 34);
+  ctx.restore();
+}
+
+// ───────────── fonts / ready ─────────────
+const fontLoads = ["700 64px 'Roboto Condensed'", "400 40px 'Roboto Condensed'", "800 40px Montserrat",
+  "900 40px Montserrat", "700 30px Montserrat", "600 30px Montserrat"].map(f => document.fonts.load(f).catch(() => {}));
+const timeout = new Promise(r => setTimeout(r, 5000));
+const ready = Promise.race([Promise.all([...fontLoads, ...imgLoads]), timeout]).then(() => document.fonts.ready);
+
+window.CHART = { ready, render, total: TOTAL, fps: C.fps, width: W, height: H, events: EVENTS };
+
+// ───────────── preview player ─────────────
+if (RECORD) { ready.then(() => render(0)); return; }
+
+let playing = true, start = performance.now(), tNow = 0, recording = false;
+const fixedT = params.get("t");
+const $ = (id) => document.getElementById(id);
+const seek = $("seek"), timeLbl = $("time"), playBtn = $("play");
+
+function frame(now) {
+  if (playing) {
+    tNow = (now - start) / 1000;
+    if (tNow > TOTAL) {
+      if (recording) { tNow = TOTAL; } else { start = now; tNow = 0; }
+    }
+  }
+  render(tNow);
+  seek.value = Math.round(tNow / TOTAL * 1000);
+  timeLbl.textContent = tNow.toFixed(1) + "s / " + TOTAL.toFixed(1) + "s";
+  requestAnimationFrame(frame);
+}
+function setPlaying(v) { playing = v; playBtn.textContent = v ? "⏸" : "▶"; if (v) start = performance.now() - tNow * 1000; }
+playBtn.onclick = () => setPlaying(!playing);
+$("restart").onclick = () => { tNow = 0; start = performance.now(); setPlaying(true); };
+seek.oninput = () => { tNow = seek.value / 1000 * TOTAL; start = performance.now() - tNow * 1000; };
+document.addEventListener("keydown", (ev) => {
+  if (ev.code === "Space") { ev.preventDefault(); setPlaying(!playing); }
+  if (ev.key === "r" || ev.key === "R") $("restart").onclick();
+});
+
+// in-browser real-time recording (MediaRecorder) — handy, but record_video.py gives a cleaner MP4
+$("rec").onclick = () => {
+  if (recording) return;
+  const types = ["video/mp4;codecs=avc1.640028", "video/mp4;codecs=avc1", "video/mp4", "video/webm;codecs=vp9", "video/webm"];
+  const mime = types.find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m));
+  if (!mime) { msg("Este navegador no puede grabar. Usa: python record_video.py"); return; }
+  let stream;
+  try { stream = cv.captureStream(C.fps); } catch (err) { msg("No se pudo capturar el canvas (abre la página con un servidor local)."); return; }
+  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12e6 });
+  const chunks = [];
+  rec.ondataavailable = (ev) => ev.data.size && chunks.push(ev.data);
+  rec.onstop = () => {
+    recording = false; $("rec").textContent = "⏺ Grabar";
+    const blob = new Blob(chunks, { type: mime }), a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = "fini-chart." + (mime.includes("mp4") ? "mp4" : "webm"); a.click();
+  };
+  recording = true; $("rec").textContent = "● grabando…";
+  tNow = 0; start = performance.now(); setPlaying(true);
+  rec.start(250);
+  setTimeout(() => rec.stop(), (TOTAL + 0.3) * 1000);
+};
+
+ready.then(() => {
+  if (fixedT !== null) { tNow = parseFloat(fixedT) || 0; setPlaying(false); }
+  else start = performance.now();
+  requestAnimationFrame(frame);
+});
+})();
+</script>
+</body>
+</html>

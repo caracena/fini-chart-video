@@ -1,0 +1,4 @@
+yfinance>=0.2.40
+pandas>=1.5
+playwright>=1.40
+imageio-ffmpeg>=0.4.9
